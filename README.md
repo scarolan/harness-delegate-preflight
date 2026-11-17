@@ -1,5 +1,10 @@
 # Harness Delegate preflight
 
+<p align="center">
+  <img src="docs/captain-canary-preflight.jpg" width="720"
+       alt="Captain Canary on an airfield, goggles up, pointing at a clipboard of green checkmarks next to a small plane">
+</p>
+
 > **Not an official Harness tool.** A Harness Solutions Engineer wrote it, and it is
 > provided as is, under the [Apache 2.0 license](LICENSE). For help with the delegate itself,
 > contact Harness Support.
