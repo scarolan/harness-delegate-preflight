@@ -110,7 +110,64 @@ EOF
   "${K[@]}" -n "$NS" delete netpol --all >/dev/null
 }
 
-ALL="baseline values proxy ca netpol"
+sc_admission() {   # the API server refuses the delegate's pod: helm says "deployed", no pods
+  "${K[@]}" -n "$NS" create quota hdpf-tiny --hard=requests.cpu=100m >/dev/null
+  run quota 1 'Quotas and limits +resourcequota/hdpf-tiny' \
+    'rejected by a ResourceQuota: pods "harness-delegate-preflight-[a-z0-9]+" is forbidden: exceeded quota: hdpf-tiny' \
+    'kubectl describe quota -n '"$NS" 'helm would still say "deployed"' -- -f "$(values quota)"
+  "${K[@]}" -n "$NS" delete quota hdpf-tiny >/dev/null
+
+  # An allowed-registries rule, if the cluster runs Gatekeeper (Binary Authorization needs GKE;
+  # tests/create-fail.sh covers it and the other controllers offline)
+  if ! "${K[@]}" get crd constrainttemplates.templates.gatekeeper.sh >/dev/null 2>&1; then
+    say "gatekeeper: skipped (Gatekeeper isn't installed)"; return
+  fi
+  "${K[@]}" apply -f - >/dev/null <<'EOF'
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata: {name: hdpfallowedrepos}
+spec:
+  crd:
+    spec:
+      names: {kind: HdpfAllowedRepos}
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            repos: {type: array, items: {type: string}}
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      package hdpfallowedrepos
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        satisfied := [good | repo = input.parameters.repos[_]; good = startswith(container.image, repo)]
+        not any(satisfied)
+        msg := sprintf("container <%v> has an invalid image repo <%v>, allowed repos are %v", [container.name, container.image, input.parameters.repos])
+      }
+EOF
+  local i=0
+  until "${K[@]}" apply -f - >/dev/null 2>&1 <<EOF
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: HdpfAllowedRepos
+metadata: {name: hdpf-allowed-repos}
+spec:
+  match: {kinds: [{apiGroups: [""], kinds: [Pod]}], namespaces: [$NS]}
+  parameters: {repos: ["registry.invalid/"]}
+EOF
+  do i=$((i+1)); [ $i -gt 30 ] && break; sleep 2; done
+  # Wait until Gatekeeper enforces it
+  i=0
+  while "${K[@]}" run hdpf-gk-check -n "$NS" --image=busybox --restart=Never --dry-run=server >/dev/null 2>&1; do
+    i=$((i+1)); [ $i -gt 30 ] && break; sleep 2
+  done
+  run gatekeeper 1 'rejected by Gatekeeper constraint hdpf-allowed-repos' 'add us-docker\.pkg\.dev/' \
+    -- -f "$(values gatekeeper)"
+  "${K[@]}" delete hdpfallowedrepos hdpf-allowed-repos >/dev/null 2>&1
+  "${K[@]}" delete constrainttemplate hdpfallowedrepos >/dev/null 2>&1
+}
+
+ALL="baseline values proxy ca netpol admission"
 "${K[@]}" create namespace "$NS" >/dev/null 2>&1
 trap '"${K[@]}" delete namespace "$NS" --wait=false >/dev/null 2>&1' EXIT INT TERM
 for s in ${*:-$ALL}; do "sc_$s"; done

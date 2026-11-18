@@ -18,7 +18,7 @@ and changes nothing, apart from a short-lived probe pod in Kubernetes (with Helm
 also the ConfigMaps and Secrets it needs), which it deletes.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/scarolan/harness-delegate-preflight/v1.0.0/harness-delegate-preflight.sh
+curl -fsSLO https://raw.githubusercontent.com/scarolan/harness-delegate-preflight/v1.0.1/harness-delegate-preflight.sh
 bash harness-delegate-preflight.sh
 ```
 
@@ -26,10 +26,10 @@ With no options it asks for your account ID (or the Harness URL from your browse
 where the delegate will run. To check the download first, compare its SHA-256:
 
 ```bash
-echo "af644852ffa3edfd96459b8b7306e44f2900cd2b38ff9eae87f78ae3d195979f  harness-delegate-preflight.sh" | shasum -a 256 -c   # or sha256sum -c
+echo "c58d8dd7ade26c02dee3cd4a23d30fd2d1148bca403ece4abb03b564063cd26a  harness-delegate-preflight.sh" | shasum -a 256 -c   # or sha256sum -c
 ```
 
-The script and its checksum are also on the [v1.0.0 release](https://github.com/scarolan/harness-delegate-preflight/releases/tag/v1.0.0).
+The script and its checksum are also on the [v1.0.1 release](https://github.com/scarolan/harness-delegate-preflight/releases/tag/v1.0.1).
 
 ## What it checks
 
@@ -43,7 +43,7 @@ The script and its checksum are also on the [v1.0.0 release](https://github.com/
 | Delegate image | Registry auth, the manifest for this architecture, a real layer download from the registry's CDN, Docker Hub as a fallback, the Helm chart repo |
 | Helm values (`-f`) | That the chart renders with them, and the account, URL, image, proxy and CA they set. Then the in-cluster checks run in the pod they make ([below](#installing-with-helm-test-your-values)) |
 | Kubernetes (`-t k8s`) | API server, nodes and their memory, the namespace, NetworkPolicies, RBAC for the chart, Helm |
-| From inside the cluster | Starts a pod from the delegate image and reruns the network checks from it, so you test the cluster's egress, not your laptop's. An image pull that fails is classified: tag missing, auth, or network |
+| From inside the cluster | Starts a pod from the delegate image and reruns the network checks from it, so you test the cluster's egress, not your laptop's. An image pull that fails is classified: tag missing, auth, or network. A pod the cluster refuses to create is too: Binary Authorization, Gatekeeper / Policy Controller, Kyverno, Pod Security, a quota or LimitRange, RBAC. Those leave the delegate with no pods at all while `helm install` says "deployed" |
 | Container runtime (`-t docker`) | Docker access, the daemon's own proxy, CPU, memory and disk |
 | `--check host[:port]` | Anything else the delegate needs: your Git server, artifact repos, cloud APIs |
 
@@ -160,12 +160,17 @@ Desktop and k3s do), and checks after every scenario that nothing was left behin
 | `proxy` | A proxy in the values that pods can't reach |
 | `ca` | `delegateCustomCa` naming a secret that doesn't exist, then one that does |
 | `netpol` | Egress denied in the namespace, then allowed only for the delegate's labels |
+| `admission` | A ResourceQuota too small for the delegate, then (if the cluster runs Gatekeeper) an allowed-registries constraint |
 
 ```bash
 export ACCOUNT=<account ID> URL=<its Harness URL>
 CONTEXT=rancher-desktop tests/k8s-scenarios.sh          # all of them
 CONTEXT=rancher-desktop tests/k8s-scenarios.sh netpol   # some
 ```
+
+`tests/create-fail.sh` needs no cluster. It feeds the preflight the errors each admission
+controller returns, including GKE's Binary Authorization, and checks what it blames and
+suggests.
 
 ## License
 
