@@ -15,7 +15,7 @@
 #
 # Run with --help for every option. HDPF_SCRIPT_MARKER (the in-cluster check looks for this)
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 DEFAULT_GAR_REPO="us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate"
 DEFAULT_DH_REPO="harness/delegate"
 FALLBACK_TAG="26.11.90410"
@@ -1430,6 +1430,65 @@ EOF
   return 0
 }
 
+# create_fail OUTPUT NAMESPACE IMAGE: report a probe pod the API server refused to create,
+# naming what refused it (Binary Authorization, Gatekeeper, Kyverno, Pod Security, a quota,
+# a LimitRange, RBAC, ...) and what to change. Admission rejects the pod before anything
+# runs, so the delegate's Deployment would get no pods at all while helm says "deployed".
+create_fail() {
+  local raw=$1 ns=$2 img=$3 msg l who fix name prefix
+  msg=$(printf '%s' "$raw" | tr '\n' ' ' | sed -e 's/^Error from server ([^)]*): //' \
+    -e 's/^error when creating "[^"]*": //' -e 's/  */ /g' -e 's/ $//')
+  l=$(lower "$msg")
+  case $img in */*) prefix=${img%/*}/ ;; *) prefix=$img ;; esac
+  case $l in
+    *"binary authorization"*|*violates_policy*|*"image policy webhook"*|*imagepolicywebhook*)
+      who="Binary Authorization (GKE)"
+      fix="The cluster's Binary Authorization policy doesn't allow $img.
+Ask its owner to allow the Harness images, e.g. an allowlist pattern ${prefix}*
+(gcloud container binauthz policy export shows the policy), or mirror the delegate and upgrader
+images to a registry the policy allows and pass --image (Helm: delegateDockerImage, upgrader.upgraderDockerImage)." ;;
+    *gatekeeper*)
+      name=$(printf '%s' "$msg" | sed -n 's/.*denied the request: \[\([^]]*\)\].*/\1/p')
+      who="Gatekeeper${name:+ constraint $name} (Policy Controller on GKE)"
+      fix="kubectl get constraints shows it. If it's an allowed-registries rule (K8sAllowedRepos), add $prefix
+to its repos or exclude $ns from it; otherwise change what it objects to. Or mirror the delegate and
+upgrader images to an allowed registry and pass --image." ;;
+    *kyverno*)
+      name=$(printf '%s' "$msg" | sed -n 's/.*following polic[a-z]* \([A-Za-z0-9._-]*\).*/\1/p')
+      who="Kyverno${name:+ policy $name}"
+      fix="kubectl get clusterpolicy,policy -A shows it. Ask its owner for a PolicyException for the delegate in $ns,
+or change what it objects to (an image registry rule: mirror the images and pass --image)." ;;
+    *"violates podsecurity"*)
+      who="Pod Security"
+      fix="$ns enforces a Pod Security level the delegate doesn't meet (it runs as root by default).
+Label it pod-security.kubernetes.io/enforce=baseline, or run the delegate as non-root." ;;
+    *"exceeded quota"*|*"failed quota"*)
+      who="a ResourceQuota"
+      fix="The quota in $ns has no room for the delegate (1 CPU and 2 GB by default): kubectl describe quota -n $ns.
+Raise it, or lower the delegate's cpu and memory in your values." ;;
+    *"maximum cpu usage"*|*"maximum memory usage"*|*"minimum cpu usage"*|*"minimum memory usage"*|*"limit to request ratio"*)
+      who="a LimitRange"
+      fix="The delegate's requests and limits are outside what $ns allows: kubectl describe limitrange -n $ns.
+Set cpu and memory in your values within it, or ask for the LimitRange to be widened." ;;
+    *"cannot create resource"*)
+      who="your Kubernetes permissions"
+      fix="Your kubectl user can't create pods in $ns. That's your access, not the delegate's: ask for it, or have
+someone who installs the delegate run this." ;;
+    *"service account"*"not found"*|*serviceaccount*"not found"*)
+      who="a missing service account"
+      fix="The pod's service account doesn't exist in $ns. Create it, or let the chart create it (serviceAccount.create)." ;;
+    *"admission webhook"*)
+      name=$(printf '%s' "$msg" | sed -n 's/.*admission webhook "\([^"]*\)".*/\1/p')
+      who="admission webhook ${name:-(unnamed)}"
+      fix="kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations shows which tool owns it.
+Ask its owner what it objects to." ;;
+    *) who="the API server"
+       fix="An admission policy (Binary Authorization, Gatekeeper, Kyverno, Pod Security) or a quota may be rejecting it." ;;
+  esac
+  fail "Probe pod" "rejected by $who: $(printf '%s' "$msg" | cut -c1-300)" "$fix
+It would reject the delegate's pods the same way: helm would still say \"deployed\", with no pods."
+}
+
 # Build the probe pod from the chart's own Deployment: the pod the delegate will run, with
 # sleep in place of the delegate and no health probes. The chart's Secrets, ConfigMaps and
 # service account are created under the throwaway release name, and deleted afterwards.
@@ -1497,8 +1556,7 @@ helm_probe_pod() {
     fi
   fi
   if ! outp=$(k create -n "$ns" -f "$d/pod.json" 2>&1); then
-    fail "Probe pod" "couldn't create it: $(printf '%s' "$outp" | tail -1 | cut -c1-200)" \
-      "An admission policy (Pod Security, Kyverno, Gatekeeper) may be rejecting it, and it would reject the delegate the same way."
+    create_fail "$outp" "$ns" "$(kjp "$d/pod.json" '{.spec.containers[0].image}')"
     return 1
   fi
   POD_CONTAINER=$(kjp "$d/pod.json" '{.spec.containers[0].name}')
@@ -1519,7 +1577,7 @@ section_in_cluster() {
   local ns=$NAMESPACE
   if [ "${NS_EXISTS:-0}" != 1 ]; then
     ns=default
-    info "Probe namespace" "$NAMESPACE doesn't exist yet, so the probe runs in 'default'"
+    info "Probe namespace" "$NAMESPACE doesn't exist yet, so the probe runs in 'default' (policies scoped to $NAMESPACE aren't tested)"
   fi
   local name="harness-delegate-preflight-$PROBE_ID" hp=2
   POD_CONTAINER=$name
@@ -1535,8 +1593,7 @@ section_in_cluster() {
   if [ "$hp" != 0 ]; then
     info "Probe pod" "$ns/$name, image $IMAGE (deleted when done)"
     if ! outp=$(k run "$name" -n "$ns" --image="$IMAGE" --restart=Never --labels="$labels" --overrides="$overrides" 2>&1); then
-      fail "Probe pod" "couldn't create it: $(printf '%s' "$outp" | tail -1 | cut -c1-160)" \
-        "An admission policy (Pod Security, Kyverno, Gatekeeper) may be rejecting it, and it would reject the delegate the same way."
+      create_fail "$outp" "$ns" "$IMAGE"
       return
     fi
   fi
